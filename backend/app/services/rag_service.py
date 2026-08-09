@@ -27,20 +27,45 @@ def _get_faiss():
     return _faiss
 
 def _get_embeddings():
+    """Devuelve el backend de embeddings para el RAG.
+
+    Por defecto usa FastEmbed local (modelo ONNX, sin API key ni coste; se
+    descarga una vez y luego funciona offline). Anthropic no ofrece un endpoint
+    de embeddings, por lo que no se usa aquí. Si se define OPENAI_API_KEY (o
+    EMBEDDINGS_PROVIDER=openai) se usa OpenAI en su lugar.
+    """
     global _embeddings
-    if _embeddings is None:
+    if _embeddings is not None:
+        return _embeddings
+
+    provider = os.getenv("EMBEDDINGS_PROVIDER", "").strip().lower()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    # OpenAI: solo si se pide explícitamente o hay una API key de OpenAI.
+    if provider == "openai" or (provider == "" and openai_key):
         try:
             from langchain_openai import OpenAIEmbeddings
-            import openai
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            api_base = os.getenv("OPENAI_API_BASE", "https://api.anthropic.com/v1")
+            model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+            # openai_api_base opcional (p. ej. un gateway compatible con OpenAI).
+            api_base = os.getenv("OPENAI_API_BASE", "").strip() or None
             _embeddings = OpenAIEmbeddings(
-                openai_api_key=api_key,
+                openai_api_key=openai_key,
                 openai_api_base=api_base,
-                model="text-embedding-3-small"
+                model=model,
             )
+            logger.info("Embeddings: OpenAI (%s)", model)
+            return _embeddings
         except Exception as e:
-            logger.warning(f"OpenAI Embeddings no disponible: {e}")
+            logger.warning(f"OpenAI Embeddings no disponible, usando FastEmbed local: {e}")
+
+    # Por defecto: FastEmbed local (sin API key, offline tras la descarga inicial).
+    try:
+        from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+        model_name = os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
+        _embeddings = FastEmbedEmbeddings(model_name=model_name)
+        logger.info("Embeddings: FastEmbed local (%s)", model_name)
+    except Exception as e:
+        logger.warning(f"Embeddings locales no disponibles (fallback a búsqueda simple): {e}")
     return _embeddings
 
 
