@@ -84,7 +84,8 @@ class RAGService:
         self.simple_search = SimpleTextSearch()
         self.use_faiss = False
         self._initialized = False
-        
+        self._init_lock = asyncio.Lock()
+
         # Mapeo de archivos a títulos de libros
         self.book_titles = {
             "malware_dev.txt": "Malware Development for Ethical Hackers (Zhussupov, 2024)",
@@ -115,37 +116,59 @@ class RAGService:
         return chunks
     
     async def initialize(self):
-        """Inicializa el sistema RAG indexando los libros."""
+        """Inicializa el sistema RAG indexando los libros.
+
+        El trabajo pesado (I/O de archivos, chunking, embeddings y FAISS) es
+        síncrono y bloqueante, por lo que se ejecuta en un hilo aparte con
+        asyncio.to_thread para no bloquear el event loop. El lock evita que
+        varias corrutinas construyan el índice a la vez.
+        """
         if self._initialized:
             return
-        
-        logger.info("Inicializando sistema RAG...")
-        
-        # Intentar cargar índice FAISS existente
-        faiss_path = self.index_dir / "index.faiss"
-        if faiss_path.exists():
-            try:
-                FAISS = _get_faiss()
-                embeddings = _get_embeddings()
-                if FAISS and embeddings:
-                    self.vectorstore = FAISS.load_local(
-                        str(self.index_dir), 
-                        embeddings,
-                        allow_dangerous_deserialization=True
-                    )
-                    self.use_faiss = True
-                    self._initialized = True
-                    logger.info("Índice FAISS cargado exitosamente.")
-                    return
-            except Exception as e:
-                logger.warning(f"No se pudo cargar índice FAISS: {e}")
-        
-        # Indexar desde cero
-        await self._build_index()
-        self._initialized = True
-    
-    async def _build_index(self):
-        """Construye el índice desde los archivos de texto."""
+
+        async with self._init_lock:
+            # Re-comprobar tras adquirir el lock por si otra corrutina ya inicializó.
+            if self._initialized:
+                return
+
+            logger.info("Inicializando sistema RAG...")
+
+            # Intentar cargar índice FAISS existente (en un hilo)
+            faiss_path = self.index_dir / "index.faiss"
+            if faiss_path.exists():
+                try:
+                    loaded = await asyncio.to_thread(self._load_index_sync)
+                    if loaded:
+                        self._initialized = True
+                        logger.info("Índice FAISS cargado exitosamente.")
+                        return
+                except Exception as e:
+                    logger.warning(f"No se pudo cargar índice FAISS: {e}")
+
+            # Indexar desde cero (en un hilo)
+            await asyncio.to_thread(self._build_index_sync)
+            self._initialized = True
+
+    def _load_index_sync(self) -> bool:
+        """Carga un índice FAISS existente. Bloqueante: ejecutar en un hilo."""
+        FAISS = _get_faiss()
+        embeddings = _get_embeddings()
+        if FAISS and embeddings:
+            self.vectorstore = FAISS.load_local(
+                str(self.index_dir),
+                embeddings,
+                allow_dangerous_deserialization=True
+            )
+            self.use_faiss = True
+            return True
+        return False
+
+    def _build_index_sync(self):
+        """Construye el índice desde los archivos de texto.
+
+        Bloqueante (I/O de archivos, chunking, embeddings, FAISS): se ejecuta
+        en un hilo aparte desde initialize() para no bloquear el event loop.
+        """
         all_chunks = []
         all_metadata = []
         
@@ -210,10 +233,12 @@ class RAGService:
         
         try:
             if self.use_faiss and self.vectorstore:
-                docs = self.vectorstore.similarity_search(query, k=k)
+                # similarity_search hace una llamada de embeddings + búsqueda
+                # FAISS síncronas; ejecutarlas en un hilo mantiene libre el loop.
+                docs = await asyncio.to_thread(self.vectorstore.similarity_search, query, k)
                 return [{"content": d.page_content, "source": d.metadata.get("source", "Unknown")} for d in docs]
             else:
-                results = self.simple_search.similarity_search(query, k=k)
+                results = await asyncio.to_thread(self.simple_search.similarity_search, query, k)
                 return [{"content": r["page_content"], "source": r["metadata"].get("source", "Unknown")} for r in results]
         except Exception as e:
             logger.error(f"Error en búsqueda RAG: {e}")
