@@ -57,7 +57,7 @@ class Artifact(Base):
     status = Column(String(50), default="generated")  # generated, compiled, executed, failed
     execution_output = Column(Text)
     execution_error = Column(Text)
-    metadata = Column(JSON)
+    artifact_metadata = Column("metadata", JSON)  # 'metadata' is reserved by SQLAlchemy's Declarative API
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     engagement = relationship("Engagement", back_populates="artifacts")
