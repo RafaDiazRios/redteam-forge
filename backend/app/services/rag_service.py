@@ -136,8 +136,13 @@ class RAGService:
             chunk = text[start:end].strip()
             if len(chunk) > 100:  # Ignorar chunks muy pequeños
                 chunks.append(chunk)
+            # Al llegar al final, terminar. Sin esto, cuando end == text_len el
+            # siguiente start = text_len - overlap se repite indefinidamente
+            # (bucle infinito que agota la memoria).
+            if end >= text_len:
+                break
             start = end - overlap
-        
+
         return chunks
     
     async def initialize(self):
