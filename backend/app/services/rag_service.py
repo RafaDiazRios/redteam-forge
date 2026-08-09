@@ -27,20 +27,45 @@ def _get_faiss():
     return _faiss
 
 def _get_embeddings():
+    """Devuelve el backend de embeddings para el RAG.
+
+    Por defecto usa FastEmbed local (modelo ONNX, sin API key ni coste; se
+    descarga una vez y luego funciona offline). Anthropic no ofrece un endpoint
+    de embeddings, por lo que no se usa aquí. Si se define OPENAI_API_KEY (o
+    EMBEDDINGS_PROVIDER=openai) se usa OpenAI en su lugar.
+    """
     global _embeddings
-    if _embeddings is None:
+    if _embeddings is not None:
+        return _embeddings
+
+    provider = os.getenv("EMBEDDINGS_PROVIDER", "").strip().lower()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    # OpenAI: solo si se pide explícitamente o hay una API key de OpenAI.
+    if provider == "openai" or (provider == "" and openai_key):
         try:
             from langchain_openai import OpenAIEmbeddings
-            import openai
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            api_base = os.getenv("OPENAI_API_BASE", "https://api.anthropic.com/v1")
+            model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+            # openai_api_base opcional (p. ej. un gateway compatible con OpenAI).
+            api_base = os.getenv("OPENAI_API_BASE", "").strip() or None
             _embeddings = OpenAIEmbeddings(
-                openai_api_key=api_key,
+                openai_api_key=openai_key,
                 openai_api_base=api_base,
-                model="text-embedding-3-small"
+                model=model,
             )
+            logger.info("Embeddings: OpenAI (%s)", model)
+            return _embeddings
         except Exception as e:
-            logger.warning(f"OpenAI Embeddings no disponible: {e}")
+            logger.warning(f"OpenAI Embeddings no disponible, usando FastEmbed local: {e}")
+
+    # Por defecto: FastEmbed local (sin API key, offline tras la descarga inicial).
+    try:
+        from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+        model_name = os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
+        _embeddings = FastEmbedEmbeddings(model_name=model_name)
+        logger.info("Embeddings: FastEmbed local (%s)", model_name)
+    except Exception as e:
+        logger.warning(f"Embeddings locales no disponibles (fallback a búsqueda simple): {e}")
     return _embeddings
 
 
@@ -84,7 +109,8 @@ class RAGService:
         self.simple_search = SimpleTextSearch()
         self.use_faiss = False
         self._initialized = False
-        
+        self._init_lock = asyncio.Lock()
+
         # Mapeo de archivos a títulos de libros
         self.book_titles = {
             "malware_dev.txt": "Malware Development for Ethical Hackers (Zhussupov, 2024)",
@@ -110,42 +136,69 @@ class RAGService:
             chunk = text[start:end].strip()
             if len(chunk) > 100:  # Ignorar chunks muy pequeños
                 chunks.append(chunk)
+            # Al llegar al final, terminar. Sin esto, cuando end == text_len el
+            # siguiente start = text_len - overlap se repite indefinidamente
+            # (bucle infinito que agota la memoria).
+            if end >= text_len:
+                break
             start = end - overlap
-        
+
         return chunks
     
     async def initialize(self):
-        """Inicializa el sistema RAG indexando los libros."""
+        """Inicializa el sistema RAG indexando los libros.
+
+        El trabajo pesado (I/O de archivos, chunking, embeddings y FAISS) es
+        síncrono y bloqueante, por lo que se ejecuta en un hilo aparte con
+        asyncio.to_thread para no bloquear el event loop. El lock evita que
+        varias corrutinas construyan el índice a la vez.
+        """
         if self._initialized:
             return
-        
-        logger.info("Inicializando sistema RAG...")
-        
-        # Intentar cargar índice FAISS existente
-        faiss_path = self.index_dir / "index.faiss"
-        if faiss_path.exists():
-            try:
-                FAISS = _get_faiss()
-                embeddings = _get_embeddings()
-                if FAISS and embeddings:
-                    self.vectorstore = FAISS.load_local(
-                        str(self.index_dir), 
-                        embeddings,
-                        allow_dangerous_deserialization=True
-                    )
-                    self.use_faiss = True
-                    self._initialized = True
-                    logger.info("Índice FAISS cargado exitosamente.")
-                    return
-            except Exception as e:
-                logger.warning(f"No se pudo cargar índice FAISS: {e}")
-        
-        # Indexar desde cero
-        await self._build_index()
-        self._initialized = True
-    
-    async def _build_index(self):
-        """Construye el índice desde los archivos de texto."""
+
+        async with self._init_lock:
+            # Re-comprobar tras adquirir el lock por si otra corrutina ya inicializó.
+            if self._initialized:
+                return
+
+            logger.info("Inicializando sistema RAG...")
+
+            # Intentar cargar índice FAISS existente (en un hilo)
+            faiss_path = self.index_dir / "index.faiss"
+            if faiss_path.exists():
+                try:
+                    loaded = await asyncio.to_thread(self._load_index_sync)
+                    if loaded:
+                        self._initialized = True
+                        logger.info("Índice FAISS cargado exitosamente.")
+                        return
+                except Exception as e:
+                    logger.warning(f"No se pudo cargar índice FAISS: {e}")
+
+            # Indexar desde cero (en un hilo)
+            await asyncio.to_thread(self._build_index_sync)
+            self._initialized = True
+
+    def _load_index_sync(self) -> bool:
+        """Carga un índice FAISS existente. Bloqueante: ejecutar en un hilo."""
+        FAISS = _get_faiss()
+        embeddings = _get_embeddings()
+        if FAISS and embeddings:
+            self.vectorstore = FAISS.load_local(
+                str(self.index_dir),
+                embeddings,
+                allow_dangerous_deserialization=True
+            )
+            self.use_faiss = True
+            return True
+        return False
+
+    def _build_index_sync(self):
+        """Construye el índice desde los archivos de texto.
+
+        Bloqueante (I/O de archivos, chunking, embeddings, FAISS): se ejecuta
+        en un hilo aparte desde initialize() para no bloquear el event loop.
+        """
         all_chunks = []
         all_metadata = []
         
@@ -210,10 +263,12 @@ class RAGService:
         
         try:
             if self.use_faiss and self.vectorstore:
-                docs = self.vectorstore.similarity_search(query, k=k)
+                # similarity_search hace una llamada de embeddings + búsqueda
+                # FAISS síncronas; ejecutarlas en un hilo mantiene libre el loop.
+                docs = await asyncio.to_thread(self.vectorstore.similarity_search, query, k)
                 return [{"content": d.page_content, "source": d.metadata.get("source", "Unknown")} for d in docs]
             else:
-                results = self.simple_search.similarity_search(query, k=k)
+                results = await asyncio.to_thread(self.simple_search.similarity_search, query, k)
                 return [{"content": r["page_content"], "source": r["metadata"].get("source", "Unknown")} for r in results]
         except Exception as e:
             logger.error(f"Error en búsqueda RAG: {e}")
